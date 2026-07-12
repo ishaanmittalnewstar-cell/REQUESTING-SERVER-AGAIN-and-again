@@ -4,7 +4,7 @@ from flask import Flask
 
 app = Flask(__name__)
 
-URLS = [
+URL = [
     "https://choir-p1h3.onrender.com",
     "https://timings-requests.onrender.com"
 ]
@@ -12,7 +12,7 @@ URLS = [
 @app.route('/')
 def ping_service():
     summary = []
-    for url in URLS:
+    for url in URL:
         try:
             response = requests.get(url, timeout=10)
             summary.append(f"{url}: {response.status_code}")

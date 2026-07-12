@@ -5,8 +5,8 @@ from flask import Flask
 app = Flask(__name__)
 
 URLS = [
-    "https://onrender.com",
-    "https://onrender.com"
+    "https://choir-p1h3.onrender.com",
+    "https://timings-requests.onrender.com"
 ]
 
 @app.route('/')

